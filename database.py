@@ -10,6 +10,7 @@ Postgres med minimala ändringar i app.py.
 """
 import os
 import re
+import threading
 from contextlib import contextmanager
 
 import psycopg2
@@ -17,6 +18,28 @@ import psycopg2.extras
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 DB_SCHEMA = os.environ.get("DB_SCHEMA", "foreningsbokning")
+
+# Återanvänd en enda uppkoppling mot databasen per processt (gunicorn-worker)
+# istället för att öppna en ny anslutning (med TCP/TLS-handskakning och
+# autentisering mot Supabase) för varje enskild förfrågan. Det var den stora
+# anledningen till att sidan kändes seg - en ny anslutning tog ofta
+# 1-3 sekunder att sätta upp. SET search_path körs ändå i varje request,
+# eftersom Supabase Transaction Pooler kan ge olika bakomliggande
+# databas-sessioner för olika transaktioner på samma klientuppkoppling.
+_conn = None
+_conn_lock = threading.Lock()
+
+
+def _ny_anslutning():
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+
+
+def _hamta_anslutning():
+    global _conn
+    with _conn_lock:
+        if _conn is None or _conn.closed:
+            _conn = _ny_anslutning()
+        return _conn
 
 _PLACEHOLDER = re.compile(r"\?")
 
@@ -142,15 +165,28 @@ class _CompatConnection:
 
 @contextmanager
 def get_db():
-    conn = psycopg2.connect(DATABASE_URL)
+    global _conn
+    conn = _hamta_anslutning()
     try:
         with conn.cursor() as cur:
             cur.execute(f"SET search_path TO {DB_SCHEMA}, public")
         wrapped = _CompatConnection(conn)
         yield wrapped
         conn.commit()
-    finally:
-        conn.close()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        # Anslutningen är trasig (t.ex. timeout eller avbruten av poolern).
+        # Stäng den och tvinga fram en ny anslutning nästa gång get_db() anropas.
+        with _conn_lock:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if _conn is conn:
+                _conn = None
+        raise
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def init_db():
