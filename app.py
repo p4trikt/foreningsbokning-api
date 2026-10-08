@@ -11,6 +11,7 @@ from functools import wraps
 
 from flask import Flask, jsonify, request, session
 from flask_cors import CORS
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from database import init_db, get_db, ensure_admin
@@ -35,6 +36,29 @@ _allowed_origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").spl
 CORS(app, supports_credentials=True, origins=_allowed_origins or "*")
 
 GILTIGA_STATUSAR = {"vantande", "bekraftad", "nekad", "avbokad", "raderad"}
+
+# Inloggning via token (Authorization: Bearer ...) utöver sessionskakan.
+# Safari/iPhone och många in-app-webbläsare blockerar kakor från en annan
+# domän (frontend på github.io, API på railway.app), så kakan ensam räcker inte.
+_token_serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"], salt="forening-login")
+TOKEN_MAX_ALDER = 30 * 24 * 3600
+
+
+def skapa_token(forening_id, is_admin):
+    return _token_serializer.dumps({"fid": forening_id, "admin": bool(is_admin)})
+
+
+@app.before_request
+def inloggning_via_token():
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return
+    try:
+        data = _token_serializer.loads(auth[7:], max_age=TOKEN_MAX_ALDER)
+    except (BadSignature, SignatureExpired):
+        return
+    session["forening_id"] = data["fid"]
+    session["is_admin"] = bool(data["admin"])
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +209,11 @@ def login():
     session.permanent = True
     session["forening_id"] = row["id"]
     session["is_admin"] = bool(row["is_admin"])
-    return jsonify({"ok": True, "forening": forening_till_dict(row)})
+    return jsonify({
+        "ok": True,
+        "forening": forening_till_dict(row),
+        "token": skapa_token(row["id"], row["is_admin"]),
+    })
 
 
 @app.route("/api/logout", methods=["POST"])
@@ -273,10 +301,11 @@ def skapa_bokning():
             (objekt_id, session["forening_id"], start.isoformat(), slut.isoformat(), kommentar),
         )
         booking_id = cur.lastrowid
-        forening = conn.execute("SELECT namn FROM foreningar WHERE id = ?", (session["forening_id"],)).fetchone()
+        forening = conn.execute("SELECT namn, email FROM foreningar WHERE id = ?", (session["forening_id"],)).fetchone()
         objekt_namn = objekt["namn"]
 
     email_utils.notify_admin_ny_bokning(objekt_namn, forening["namn"], start.isoformat(), slut.isoformat(), booking_id)
+    email_utils.notify_forening_mottagen(forening["email"], objekt_namn, start.isoformat(), slut.isoformat(), booking_id)
 
     return jsonify({"ok": True, "meddelande": "Bokningsförfrågan skickad. Den väntar nu på godkännande.", "id": booking_id})
 
